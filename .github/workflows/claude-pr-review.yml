@@ -44,19 +44,60 @@ jobs:
           pr_title=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.title')
           pr_body=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.body // ""')
 
-          # Fetch PR diff
-          diff=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" \
-            -H "Accept: application/vnd.github.v3.diff")
+          # Get changed files with patch data (flatten paginated arrays)
+          gh api "repos/${REPO}/pulls/${PR_NUMBER}/files" --paginate | jq -s 'add' > /tmp/pr_files.json
+
+          changed_files=$(jq -r '.[].filename' /tmp/pr_files.json)
+
+          # Build annotated diff with absolute line numbers per file
+          diff=""
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            patch=$(jq -r --arg f "$file" '.[] | select(.filename == $f) | .patch // ""' /tmp/pr_files.json)
+            [ -z "$patch" ] && continue
+
+            file_diff="### ${file}"$'\n'
+            line_num=0
+            while IFS= read -r line; do
+              if [[ "$line" =~ ^@@\ -[0-9]+(,[0-9]+)?\ \+([0-9]+)(,[0-9]+)?\ @@ ]]; then
+                line_num=${BASH_REMATCH[2]}
+                file_diff+="${line}"$'\n'
+              elif [[ "$line" =~ ^- ]]; then
+                file_diff+="${line}"$'\n'
+              elif [[ "$line" =~ ^\+ ]]; then
+                file_diff+="L${line_num}: ${line}"$'\n'
+                ((line_num++))
+              else
+                file_diff+="L${line_num}: ${line}"$'\n'
+                ((line_num++))
+              fi
+            done <<< "$patch"
+
+            diff+="${file_diff}"$'\n'
+          done <<< "$changed_files"
+
+          # Fallback to raw diff if annotated diff is empty
+          if [ -z "$(echo "$diff" | tr -d '[:space:]')" ]; then
+            echo "::warning::Annotated diff was empty, falling back to raw diff"
+            diff=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" \
+              -H "Accept: application/vnd.github.v3.diff")
+          fi
 
           # Truncate diff if it exceeds the limit
           truncated=""
           if [ "${#diff}" -gt "${MAX_DIFF_CHARS}" ]; then
             diff="${diff:0:${MAX_DIFF_CHARS}}"
-            truncated="\n\n[NOTE: Diff was truncated at ${MAX_DIFF_CHARS} characters. Some changes were not reviewed.]"
+            truncated=$'\n\n'"[NOTE: Diff was truncated at ${MAX_DIFF_CHARS} characters. Some changes were not reviewed.]"
           fi
 
           # Build system prompt
           system_prompt="You are an expert code reviewer. Review the following pull request diff carefully and provide actionable feedback.
+
+          CRITICAL — Line number format:
+          - Each line in the diff is prefixed with its absolute line number in the new file, e.g. \`L42: +  int x = 0;\`
+          - You MUST reference every issue with the exact format: \`filename:LINE_NUMBER\` — for example: \`src/main.cpp:42\`
+          - Every finding, suggestion, or observation MUST include at least one \`filename:LINE_NUMBER\` reference
+          - Group findings by file, and list line numbers for each issue
 
           Focus on:
           1. **Bugs & Correctness** — Logic errors, off-by-one mistakes, null/undefined risks, race conditions
