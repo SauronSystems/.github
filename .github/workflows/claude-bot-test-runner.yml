@@ -1,0 +1,150 @@
+name: Claude Bot Test Runner
+
+on:
+  workflow_call:
+    inputs:
+      comment_id:
+        description: "ID of the triggering comment"
+        type: number
+        required: true
+      pr_number:
+        description: "Pull request number"
+        type: number
+        required: true
+      comment_user:
+        description: "Username who triggered the bot"
+        type: string
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  run-tests:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get PR branch
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          pr_json=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}")
+          echo "ref=$(echo "$pr_json" | jq -r '.head.ref')" >> "$GITHUB_OUTPUT"
+          echo "sha=$(echo "$pr_json" | jq -r '.head.sha')" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.pr.outputs.ref }}
+
+      - name: React to comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          COMMENT_ID: ${{ inputs.comment_id }}
+        run: |
+          gh api "repos/${REPO}/issues/comments/${COMMENT_ID}/reactions" \
+            -f content='eyes'
+
+      - name: Detect and run tests
+        id: tests
+        run: |
+          set -euo pipefail
+          result_file=$(mktemp)
+          exit_code=0
+
+          run_and_capture() {
+            echo "### Running: \`$*\`" >> "$result_file"
+            echo '```' >> "$result_file"
+            if "$@" >> "$result_file" 2>&1; then
+              echo '```' >> "$result_file"
+            else
+              exit_code=$?
+              echo '```' >> "$result_file"
+            fi
+          }
+
+          # Auto-detect test method
+          if [ -f "CMakeLists.txt" ]; then
+            echo "Detected CMake project"
+            cmake -B build -S .
+            cmake --build build
+            run_and_capture ctest --test-dir build
+          elif [ -f "Makefile" ] || [ -f "makefile" ]; then
+            echo "Detected Makefile project"
+            if grep -q 'test:' Makefile makefile 2>/dev/null; then
+              run_and_capture make test
+            else
+              run_and_capture make
+            fi
+          elif [ -f "package.json" ]; then
+            echo "Detected Node.js project"
+            npm ci
+            run_and_capture npm test
+          elif [ -f "Cargo.toml" ]; then
+            echo "Detected Rust project"
+            run_and_capture cargo test
+          elif [ -f "go.mod" ]; then
+            echo "Detected Go project"
+            run_and_capture go test ./...
+          elif [ -f "pyproject.toml" ] || [ -f "setup.py" ]; then
+            echo "Detected Python project"
+            pip install -e ".[test]" 2>/dev/null || pip install -e . 2>/dev/null || true
+            run_and_capture python -m pytest
+          else
+            echo "No recognized build system found. Attempting to compile C/C++ files." >> "$result_file"
+            shopt -s nullglob globstar
+            cpp_files=(**/*.cpp **/*.cc **/*.c)
+            if [ ${#cpp_files[@]} -gt 0 ]; then
+              run_and_capture g++ -o test_binary "${cpp_files[@]}" -std=c++17
+              if [ -f test_binary ]; then
+                run_and_capture ./test_binary
+              fi
+            else
+              echo "No test method detected." >> "$result_file"
+              exit_code=1
+            fi
+          fi
+
+          echo "exit_code=${exit_code}" >> "$GITHUB_OUTPUT"
+          {
+            echo "output<<TESTEOF"
+            cat "$result_file"
+            echo "TESTEOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Post results
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          EXIT_CODE: ${{ steps.tests.outputs.exit_code }}
+          TEST_OUTPUT: ${{ steps.tests.outputs.output }}
+          PR_SHA: ${{ steps.pr.outputs.sha }}
+          COMMENT_USER: ${{ inputs.comment_user }}
+        run: |
+          if [ "${EXIT_CODE}" = "0" ]; then
+            status="✅ Tests passed"
+          else
+            status="❌ Tests failed (exit code: ${EXIT_CODE})"
+          fi
+
+          body=$(cat <<EOF
+          ## 🤖 Claude Bot — Test Results
+
+          **Status:** ${status}
+          **Commit:** \`${PR_SHA}\`
+
+          ${TEST_OUTPUT}
+
+          ---
+          *Triggered by @${COMMENT_USER}*
+          EOF
+          )
+
+          gh pr comment "${PR_NUMBER}" --repo "${REPO}" --body "${body}"
