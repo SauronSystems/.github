@@ -1,0 +1,147 @@
+name: Claude PR Review
+
+on:
+  workflow_call:
+    inputs:
+      claude_model:
+        description: "Claude model to use for review"
+        type: string
+        default: "claude-sonnet-4-6"
+      max_diff_chars:
+        description: "Maximum characters of diff to send to Claude"
+        type: number
+        default: 80000
+      review_focus:
+        description: "Additional review instructions for Claude"
+        type: string
+        default: ""
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    name: Claude Code Review
+    runs-on: ubuntu-latest
+    steps:
+      - name: Review PR with Claude
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_MODEL: ${{ inputs.claude_model }}
+          MAX_DIFF_CHARS: ${{ inputs.max_diff_chars }}
+          REVIEW_FOCUS: ${{ inputs.review_focus }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # Fetch PR metadata
+          pr_title=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.title')
+          pr_body=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.body // ""')
+
+          # Fetch PR diff
+          diff=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" \
+            -H "Accept: application/vnd.github.v3.diff")
+
+          # Truncate diff if it exceeds the limit
+          truncated=""
+          if [ "${#diff}" -gt "${MAX_DIFF_CHARS}" ]; then
+            diff="${diff:0:${MAX_DIFF_CHARS}}"
+            truncated="\n\n[NOTE: Diff was truncated at ${MAX_DIFF_CHARS} characters. Some changes were not reviewed.]"
+          fi
+
+          # Build system prompt
+          system_prompt="You are an expert code reviewer. Review the following pull request diff carefully and provide actionable feedback.
+
+          Focus on:
+          1. **Bugs & Correctness** — Logic errors, off-by-one mistakes, null/undefined risks, race conditions
+          2. **Security** — Injection vulnerabilities, secret exposure, auth/authz issues, unsafe input handling
+          3. **Performance** — Unnecessary allocations, N+1 queries, missing indexes, algorithmic complexity
+          4. **Code Quality** — Readability, naming, duplication, adherence to project conventions
+          5. **Suggestions** — Better approaches, missing edge cases, test coverage gaps"
+
+          if [ -n "${REVIEW_FOCUS}" ]; then
+            system_prompt="${system_prompt}
+
+          Additional review instructions: ${REVIEW_FOCUS}"
+          fi
+
+          system_prompt="${system_prompt}
+
+          End your review with one of:
+          - **Verdict: APPROVE** — No significant issues found
+          - **Verdict: REQUEST CHANGES** — Issues that should be fixed before merging
+          - **Verdict: NEEDS DISCUSSION** — Design or architectural concerns to discuss"
+
+          # Build user message
+          user_message="## Pull Request: ${pr_title}
+
+          ### Description
+          ${pr_body}
+
+          ### Diff
+          \`\`\`diff
+          ${diff}${truncated}
+          \`\`\`"
+
+          # Build API payload with jq (handles all JSON escaping safely)
+          payload=$(jq -n \
+            --arg model "${CLAUDE_MODEL}" \
+            --arg system "${system_prompt}" \
+            --arg user "${user_message}" \
+            '{
+              model: $model,
+              max_tokens: 4096,
+              system: $system,
+              messages: [
+                {
+                  role: "user",
+                  content: $user
+                }
+              ]
+            }')
+
+          # Call Claude API
+          response=$(curl -s -w "\n%{http_code}" \
+            "https://api.anthropic.com/v1/messages" \
+            -H "Content-Type: application/json" \
+            -H "x-api-key: ${ANTHROPIC_API_KEY}" \
+            -H "anthropic-version: 2023-06-01" \
+            -d "${payload}")
+
+          # Split response body and status code
+          http_code=$(echo "${response}" | tail -1)
+          body=$(echo "${response}" | sed '$d')
+
+          if [ "${http_code}" -ne 200 ]; then
+            echo "::error::Claude API returned HTTP ${http_code}"
+            echo "${body}" | jq . 2>/dev/null || echo "${body}"
+            exit 1
+          fi
+
+          # Extract review text
+          review=$(echo "${body}" | jq -r '.content[0].text')
+
+          if [ -z "${review}" ] || [ "${review}" = "null" ]; then
+            echo "::error::Failed to extract review text from Claude response"
+            echo "${body}" | jq .
+            exit 1
+          fi
+
+          # Build comment body
+          comment="## 🤖 Claude AI Code Review
+
+          ${review}
+
+          ---
+          *Automated review by [Claude](https://claude.ai) (${CLAUDE_MODEL})*"
+
+          # Post as PR comment
+          gh pr comment "${PR_NUMBER}" --repo "${REPO}" --body "${comment}"
+
+          echo "✅ Review posted successfully"
