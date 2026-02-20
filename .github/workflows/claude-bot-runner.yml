@@ -15,6 +15,10 @@ on:
         description: "Username who triggered the bot"
         type: string
         required: true
+      comment_body:
+        description: "Full text of the triggering comment"
+        type: string
+        required: true
       claude_model:
         description: "Claude model to use for review"
         type: string
@@ -72,11 +76,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Get diff scoped to files changed in this PR
           diff=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" \
             -H "Accept: application/vnd.github.v3.diff")
 
-          # Get list of changed files for context
           changed_files=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/files" \
             --paginate --jq '.[].filename')
 
@@ -98,6 +100,20 @@ jobs:
             echo "FILESEOF"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Parse user instructions
+        id: instructions
+        env:
+          COMMENT_BODY: ${{ inputs.comment_body }}
+        run: |
+          # Strip the @claude-bot mention and extract the user's instruction
+          user_instruction=$(echo "${COMMENT_BODY}" | sed 's/@claude-bot//gI' | xargs)
+
+          {
+            echo "instruction<<INSTREOF"
+            echo "${user_instruction}"
+            echo "INSTREOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Review with Claude
         id: review
         env:
@@ -107,12 +123,18 @@ jobs:
           PR_BODY: ${{ steps.pr.outputs.body }}
           PR_DIFF: ${{ steps.diff.outputs.diff }}
           CHANGED_FILES: ${{ steps.diff.outputs.changed_files }}
+          USER_INSTRUCTION: ${{ steps.instructions.outputs.instruction }}
         run: |
           set -euo pipefail
 
           system_prompt="You are a senior software engineer performing a thorough code review. Review ONLY the changes in this pull request diff — do not comment on unchanged code.
 
-          Evaluate the changes for:
+          IMPORTANT — Line number references:
+          - The diff uses unified diff format. Each hunk header shows \`@@ -old_start,old_count +new_start,new_count @@\`
+          - When referencing issues, use the format: \`file/path.ext:LINE_NUMBER\` where LINE_NUMBER is the line number in the NEW file (the + side of the diff)
+          - This allows reviewers to jump directly to the relevant code
+
+          Default review categories (apply all unless the user requests a specific focus):
           1. **Bugs & Correctness** — Logic errors, off-by-one mistakes, null/undefined risks, race conditions, incorrect return values
           2. **Security** — Injection vulnerabilities, secret exposure, buffer overflows, auth/authz issues, unsafe input handling
           3. **Performance** — Unnecessary allocations, redundant operations, algorithmic complexity, memory leaks, resource cleanup
@@ -120,13 +142,14 @@ jobs:
           5. **Linting & Style** — Consistent formatting, proper includes, warning-free compilation flags, modern language idioms
           6. **Suggestions** — Better approaches, missing edge cases, test coverage gaps
 
-          Be specific: reference file names and line numbers. Prioritize issues by severity. If code is clean, say so briefly — don't invent problems.
+          Prioritize issues by severity. If code is clean, say so briefly — don't invent problems.
 
           End your review with one of:
           - **Verdict: APPROVE** — No significant issues found
           - **Verdict: REQUEST CHANGES** — Issues that should be fixed before merging
           - **Verdict: NEEDS DISCUSSION** — Design or architectural concerns to discuss"
 
+          # Build user message with optional focus instruction
           user_message="## Pull Request: ${PR_TITLE}
 
           ### Description
@@ -139,6 +162,14 @@ jobs:
           \`\`\`diff
           ${PR_DIFF}
           \`\`\`"
+
+          if [ -n "${USER_INSTRUCTION}" ]; then
+            user_message="${user_message}
+
+          ### Reviewer Instructions
+          The reviewer specifically asked: **${USER_INSTRUCTION}**
+          Focus your review on this request. If the request is about a specific aspect (e.g. 'check for linting', 'review security', 'check memory leaks'), prioritize that category but still flag any critical issues in other categories."
+          fi
 
           payload=$(jq -n \
             --arg model "${CLAUDE_MODEL}" \
@@ -195,9 +226,18 @@ jobs:
           PR_SHA: ${{ steps.pr.outputs.sha }}
           COMMENT_USER: ${{ inputs.comment_user }}
           CLAUDE_MODEL: ${{ inputs.claude_model }}
+          USER_INSTRUCTION: ${{ steps.instructions.outputs.instruction }}
         run: |
+          if [ -n "${USER_INSTRUCTION}" ]; then
+            focus_line="**Focus:** ${USER_INSTRUCTION}"
+          else
+            focus_line="**Focus:** Full review"
+          fi
+
           comment=$(cat <<EOF
           ## 🤖 Claude Code Review
+
+          ${focus_line}
 
           ${REVIEW}
 

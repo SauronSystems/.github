@@ -1,0 +1,39 @@
+name: Claude Bot Welcome
+
+on:
+  workflow_call:
+
+permissions:
+  pull-requests: write
+
+jobs:
+  welcome:
+    name: Post Welcome Comment
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post available commands
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          comment=$(cat <<'EOF'
+          ## 🤖 Claude Bot is available for this PR
+
+          Mention `@claude-bot` with an optional instruction to request a review:
+
+          | Command | Description |
+          |---|---|
+          | `@claude-bot` | Full review (all categories) |
+          | `@claude-bot review code` | General code review |
+          | `@claude-bot check for linting` | Focus on style, formatting, and language idioms |
+          | `@claude-bot check memory leaks` | Focus on memory management and resource cleanup |
+          | `@claude-bot review security` | Focus on security vulnerabilities |
+          | `@claude-bot check performance` | Focus on performance and algorithmic complexity |
+          | `@claude-bot check best practices` | Focus on naming, readability, and conventions |
+
+          You can also write any custom instruction, e.g. `@claude-bot check for proper error handling in the auth module`
+          EOF
+          )
+
+          gh pr comment "${PR_NUMBER}" --repo "${REPO}" --body "${comment}"
