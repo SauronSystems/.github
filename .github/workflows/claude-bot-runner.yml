@@ -76,21 +76,51 @@ jobs:
         run: |
           set -euo pipefail
 
-          diff=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" \
-            -H "Accept: application/vnd.github.v3.diff")
+          # Get changed files with patch data
+          gh api "repos/${REPO}/pulls/${PR_NUMBER}/files" --paginate > /tmp/pr_files.json
 
-          changed_files=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/files" \
-            --paginate --jq '.[].filename')
+          changed_files=$(jq -r '.[].filename' /tmp/pr_files.json)
+
+          # Build annotated diff with absolute line numbers per file
+          annotated_diff=""
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            patch=$(jq -r --arg f "$file" '.[] | select(.filename == $f) | .patch // ""' /tmp/pr_files.json)
+            [ -z "$patch" ] && continue
+
+            file_diff="### ${file}"$'\n'
+
+            # Parse hunks and add absolute line numbers
+            line_num=0
+            while IFS= read -r line; do
+              if [[ "$line" =~ ^@@\ -[0-9]+(,[0-9]+)?\ \+([0-9]+)(,[0-9]+)?\ @@ ]]; then
+                line_num=${BASH_REMATCH[2]}
+                file_diff+="${line}"$'\n'
+              elif [[ "$line" =~ ^- ]]; then
+                # Deleted line — no new line number
+                file_diff+="${line}"$'\n'
+              elif [[ "$line" =~ ^\+ ]]; then
+                file_diff+="L${line_num}: ${line}"$'\n'
+                ((line_num++))
+              else
+                # Context line
+                file_diff+="L${line_num}: ${line}"$'\n'
+                ((line_num++))
+              fi
+            done <<< "$patch"
+
+            annotated_diff+="${file_diff}"$'\n'
+          done <<< "$changed_files"
 
           truncated=""
-          if [ "${#diff}" -gt "${MAX_DIFF_CHARS}" ]; then
-            diff="${diff:0:${MAX_DIFF_CHARS}}"
-            truncated="\n\n[NOTE: Diff was truncated at ${MAX_DIFF_CHARS} characters. Some changes were not reviewed.]"
+          if [ "${#annotated_diff}" -gt "${MAX_DIFF_CHARS}" ]; then
+            annotated_diff="${annotated_diff:0:${MAX_DIFF_CHARS}}"
+            truncated=$'\n\n'"[NOTE: Diff was truncated at ${MAX_DIFF_CHARS} characters. Some changes were not reviewed.]"
           fi
 
           {
             echo "diff<<DIFFEOF"
-            echo "${diff}${truncated}"
+            echo "${annotated_diff}${truncated}"
             echo "DIFFEOF"
           } >> "$GITHUB_OUTPUT"
 
@@ -129,10 +159,11 @@ jobs:
 
           system_prompt="You are a senior software engineer performing a thorough code review. Review ONLY the changes in this pull request diff — do not comment on unchanged code.
 
-          IMPORTANT — Line number references:
-          - The diff uses unified diff format. Each hunk header shows \`@@ -old_start,old_count +new_start,new_count @@\`
-          - When referencing issues, use the format: \`file/path.ext:LINE_NUMBER\` where LINE_NUMBER is the line number in the NEW file (the + side of the diff)
-          - This allows reviewers to jump directly to the relevant code
+          CRITICAL — Line number format:
+          - Each line in the diff is prefixed with its absolute line number in the new file, e.g. \`L42: +  int x = 0;\`
+          - You MUST reference every issue with the exact format: \`filename:LINE_NUMBER\` — for example: \`src/main.cpp:42\`
+          - Every finding, suggestion, or observation MUST include at least one \`filename:LINE_NUMBER\` reference
+          - Group findings by file, and list line numbers for each issue
 
           Default review categories (apply all unless the user requests a specific focus):
           1. **Bugs & Correctness** — Logic errors, off-by-one mistakes, null/undefined risks, race conditions, incorrect return values
