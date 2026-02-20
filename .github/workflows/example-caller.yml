@@ -1,0 +1,20 @@
+### Example: Claude PR Review — Caller Workflow
+### Copy this file to .github/workflows/ in any SauronSystems repo.
+
+name: PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  claude-review:
+    # Skip draft PRs
+    if: github.event.pull_request.draft == false
+    uses: SauronSystems/.github/.github/workflows/claude-pr-review.yml@main
+    secrets: inherit
+    ## Override defaults by uncommenting:
+    # with:
+    #   claude_model: "claude-sonnet-4-6"
+    #   max_diff_chars: 80000
+    #   review_focus: "Pay special attention to SQL injection and auth checks"
