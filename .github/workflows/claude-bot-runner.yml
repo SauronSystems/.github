@@ -1,0 +1,223 @@
+name: Claude Bot Test Runner
+
+on:
+  workflow_call:
+    inputs:
+      comment_id:
+        description: "ID of the triggering comment"
+        type: number
+        required: true
+      pr_number:
+        description: "Pull request number"
+        type: number
+        required: true
+      comment_user:
+        description: "Username who triggered the bot"
+        type: string
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  run-tests:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get PR details
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          pr_json=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}")
+          echo "ref=$(echo "$pr_json" | jq -r '.head.ref')" >> "$GITHUB_OUTPUT"
+          echo "sha=$(echo "$pr_json" | jq -r '.head.sha')" >> "$GITHUB_OUTPUT"
+          echo "base_ref=$(echo "$pr_json" | jq -r '.base.ref')" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.pr.outputs.ref }}
+          fetch-depth: 0
+
+      - name: Get changed files
+        id: changed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          BASE_REF: ${{ steps.pr.outputs.base_ref }}
+        run: |
+          # Get list of changed files from the PR (source vs destination branch)
+          gh api "repos/${REPO}/pulls/${PR_NUMBER}/files" --paginate --jq '.[].filename' > /tmp/changed_files.txt
+
+          echo "### Changed files in this PR:"
+          cat /tmp/changed_files.txt
+
+          # Categorize changed files by extension
+          cpp_files=$(grep -E '\.(cpp|cc|c|h|hpp)$' /tmp/changed_files.txt || true)
+          py_files=$(grep -E '\.py$' /tmp/changed_files.txt || true)
+          js_files=$(grep -E '\.(js|ts|jsx|tsx)$' /tmp/changed_files.txt || true)
+          rs_files=$(grep -E '\.rs$' /tmp/changed_files.txt || true)
+          go_files=$(grep -E '\.go$' /tmp/changed_files.txt || true)
+
+          {
+            echo "cpp_files<<FILESEOF"
+            echo "${cpp_files}"
+            echo "FILESEOF"
+            echo "py_files<<FILESEOF"
+            echo "${py_files}"
+            echo "FILESEOF"
+            echo "js_files<<FILESEOF"
+            echo "${js_files}"
+            echo "FILESEOF"
+            echo "rs_files<<FILESEOF"
+            echo "${rs_files}"
+            echo "FILESEOF"
+            echo "go_files<<FILESEOF"
+            echo "${go_files}"
+            echo "FILESEOF"
+          } >> "$GITHUB_OUTPUT"
+
+          # Save full list for the test step
+          {
+            echo "all_files<<FILESEOF"
+            cat /tmp/changed_files.txt
+            echo "FILESEOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: React to comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          COMMENT_ID: ${{ inputs.comment_id }}
+        run: |
+          gh api "repos/${REPO}/issues/comments/${COMMENT_ID}/reactions" \
+            -f content='eyes'
+
+      - name: Detect and run tests
+        id: tests
+        env:
+          BASE_REF: ${{ steps.pr.outputs.base_ref }}
+          CHANGED_CPP: ${{ steps.changed.outputs.cpp_files }}
+          CHANGED_PY: ${{ steps.changed.outputs.py_files }}
+          CHANGED_JS: ${{ steps.changed.outputs.js_files }}
+          CHANGED_RS: ${{ steps.changed.outputs.rs_files }}
+          CHANGED_GO: ${{ steps.changed.outputs.go_files }}
+          ALL_CHANGED: ${{ steps.changed.outputs.all_files }}
+        run: |
+          set -euo pipefail
+          result_file=$(mktemp)
+          exit_code=0
+
+          run_and_capture() {
+            echo "### Running: \`$*\`" >> "$result_file"
+            echo '```' >> "$result_file"
+            if "$@" >> "$result_file" 2>&1; then
+              echo '```' >> "$result_file"
+            else
+              exit_code=$?
+              echo '```' >> "$result_file"
+            fi
+          }
+
+          # Log which files are being tested
+          echo "### Changed files in this PR:" >> "$result_file"
+          echo '```' >> "$result_file"
+          echo "${ALL_CHANGED}" >> "$result_file"
+          echo '```' >> "$result_file"
+          echo "" >> "$result_file"
+
+          # Auto-detect build system, scoped to changed files
+          if [ -f "CMakeLists.txt" ]; then
+            echo "Detected CMake project — building and running tests" >> "$result_file"
+            cmake -B build -S .
+            cmake --build build
+            run_and_capture ctest --test-dir build
+          elif [ -f "Makefile" ] || [ -f "makefile" ]; then
+            echo "Detected Makefile project" >> "$result_file"
+            if grep -q 'test:' Makefile makefile 2>/dev/null; then
+              run_and_capture make test
+            else
+              run_and_capture make
+            fi
+          elif [ -f "package.json" ] && [ -n "${CHANGED_JS}" ]; then
+            echo "Detected Node.js project with changed JS/TS files" >> "$result_file"
+            npm ci
+            run_and_capture npm test
+          elif [ -f "Cargo.toml" ] && [ -n "${CHANGED_RS}" ]; then
+            echo "Detected Rust project with changed .rs files" >> "$result_file"
+            run_and_capture cargo test
+          elif [ -f "go.mod" ] && [ -n "${CHANGED_GO}" ]; then
+            echo "Detected Go project with changed .go files" >> "$result_file"
+            # Only test packages containing changed files
+            changed_packages=$(echo "${CHANGED_GO}" | xargs -I{} dirname {} | sort -u | sed 's|^|./|')
+            run_and_capture go test ${changed_packages}
+          elif ([ -f "pyproject.toml" ] || [ -f "setup.py" ]) && [ -n "${CHANGED_PY}" ]; then
+            echo "Detected Python project with changed .py files" >> "$result_file"
+            pip install -e ".[test]" 2>/dev/null || pip install -e . 2>/dev/null || true
+            # Run pytest scoped to changed files
+            run_and_capture python -m pytest ${CHANGED_PY}
+          elif [ -n "${CHANGED_CPP}" ]; then
+            echo "Compiling only changed C/C++ files from this PR:" >> "$result_file"
+            # Filter to only files that exist (not deleted)
+            existing_files=""
+            for f in ${CHANGED_CPP}; do
+              if [ -f "$f" ]; then
+                existing_files="${existing_files} ${f}"
+              fi
+            done
+            if [ -n "${existing_files}" ]; then
+              run_and_capture g++ -o test_binary ${existing_files} -std=c++17
+              if [ -f test_binary ]; then
+                run_and_capture ./test_binary
+              fi
+            else
+              echo "All changed C/C++ files were deleted — nothing to compile." >> "$result_file"
+            fi
+          else
+            echo "No testable changes detected in this PR." >> "$result_file"
+            exit_code=1
+          fi
+
+          echo "exit_code=${exit_code}" >> "$GITHUB_OUTPUT"
+          {
+            echo "output<<TESTEOF"
+            cat "$result_file"
+            echo "TESTEOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Post results
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          EXIT_CODE: ${{ steps.tests.outputs.exit_code }}
+          TEST_OUTPUT: ${{ steps.tests.outputs.output }}
+          PR_SHA: ${{ steps.pr.outputs.sha }}
+          COMMENT_USER: ${{ inputs.comment_user }}
+        run: |
+          if [ "${EXIT_CODE}" = "0" ]; then
+            status="✅ Tests passed"
+          else
+            status="❌ Tests failed (exit code: ${EXIT_CODE})"
+          fi
+
+          body=$(cat <<EOF
+          ## 🤖 Claude Bot — Test Results
+
+          **Status:** ${status}
+          **Commit:** \`${PR_SHA}\`
+
+          ${TEST_OUTPUT}
+
+          ---
+          *Triggered by @${COMMENT_USER}*
+          EOF
+          )
+
+          gh pr comment "${PR_NUMBER}" --repo "${REPO}" --body "${body}"
