@@ -76,8 +76,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Get changed files with patch data
-          gh api "repos/${REPO}/pulls/${PR_NUMBER}/files" --paginate > /tmp/pr_files.json
+          # Get changed files with patch data (flatten paginated arrays)
+          gh api "repos/${REPO}/pulls/${PR_NUMBER}/files" --paginate | jq -s 'add' > /tmp/pr_files.json
 
           changed_files=$(jq -r '.[].filename' /tmp/pr_files.json)
 
@@ -111,6 +111,13 @@ jobs:
 
             annotated_diff+="${file_diff}"$'\n'
           done <<< "$changed_files"
+
+          # Fallback to raw diff if annotated diff is empty
+          if [ -z "$(echo "$annotated_diff" | tr -d '[:space:]')" ]; then
+            echo "::warning::Annotated diff was empty, falling back to raw diff"
+            annotated_diff=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" \
+              -H "Accept: application/vnd.github.v3.diff")
+          fi
 
           truncated=""
           if [ "${#annotated_diff}" -gt "${MAX_DIFF_CHARS}" ]; then
