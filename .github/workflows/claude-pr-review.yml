@@ -104,7 +104,15 @@ jobs:
           2. **Security** — Injection vulnerabilities, secret exposure, auth/authz issues, unsafe input handling
           3. **Performance** — Unnecessary allocations, N+1 queries, missing indexes, algorithmic complexity
           4. **Code Quality** — Readability, naming, duplication, adherence to project conventions
-          5. **Suggestions** — Better approaches, missing edge cases, test coverage gaps"
+          5. **Suggestions** — Better approaches, missing edge cases, test coverage gaps
+
+          CRITICAL — Priority buckets:
+          You MUST group ALL findings into exactly three priority sections using these headers:
+          ### 🔴 High — Breaks functionality, CI, or causes wrong behavior
+          ### 🟡 Medium — Causes confusion, false positives, or maintainability issues
+          ### 🟢 Low — Cosmetic, documentation, or no actual impact
+          List each finding as a bullet under the appropriate section. If a section has no findings, write \"None\" under it.
+          Every bullet MUST include a \`filename:LINE_NUMBER\` reference."
 
           if [ -n "${REVIEW_FOCUS}" ]; then
             system_prompt="${system_prompt}
