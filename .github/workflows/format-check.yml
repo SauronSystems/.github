@@ -1,0 +1,120 @@
+name: Format Check
+
+on:
+  workflow_call:
+    inputs:
+      python_version:
+        type: string
+        default: "3.10"
+      check_cpp:
+        type: boolean
+        default: true
+      check_python:
+        type: boolean
+        default: true
+      check_prettier:
+        type: boolean
+        default: true
+
+jobs:
+  format-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Find C/C++ files
+        if: inputs.check_cpp
+        id: cpp_files
+        run: |
+          files=$(find . -type f \( -name '*.c' -o -name '*.cpp' -o -name '*.h' -o -name '*.hpp' -o -name '*.cu' -o -name '*.cuh' \) | head -500 || true)
+          if [ -n "$files" ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check C/C++ formatting (clang-format)
+        if: inputs.check_cpp && steps.cpp_files.outputs.found == 'true'
+        id: cpp_check
+        run: |
+          sudo apt-get -qq update && sudo apt-get -qq install -y clang-format > /dev/null 2>&1
+          echo "## C/C++ Format Check" >> "$GITHUB_STEP_SUMMARY"
+          if find . -type f \( -name '*.c' -o -name '*.cpp' -o -name '*.h' -o -name '*.hpp' -o -name '*.cu' -o -name '*.cuh' \) \
+            -exec clang-format --dry-run --Werror {} + 2>&1 | tee /tmp/cpp-fmt.txt; then
+            echo "All C/C++ files are formatted correctly." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cat /tmp/cpp-fmt.txt >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            echo "cpp_failed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Python
+        if: inputs.check_python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      - name: Find Python files
+        if: inputs.check_python
+        id: py_files
+        run: |
+          files=$(find . -type f -name '*.py' | head -500 || true)
+          if [ -n "$files" ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check Python formatting (black)
+        if: inputs.check_python && steps.py_files.outputs.found == 'true'
+        id: py_check
+        run: |
+          pip install -q black
+          echo "## Python Format Check" >> "$GITHUB_STEP_SUMMARY"
+          if black --check --diff . 2>&1 | tee /tmp/py-fmt.txt; then
+            echo "All Python files are formatted correctly." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo '```diff' >> "$GITHUB_STEP_SUMMARY"
+            cat /tmp/py-fmt.txt >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            echo "py_failed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Find Prettier files
+        if: inputs.check_prettier
+        id: prettier_files
+        run: |
+          files=$(find . -type f \( -name '*.json' -o -name '*.yml' -o -name '*.yaml' -o -name '*.md' \) \
+            -not -path './.git/*' -not -path '*/node_modules/*' | head -500 || true)
+          if [ -n "$files" ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check JSON/YAML/Markdown formatting (prettier)
+        if: inputs.check_prettier && steps.prettier_files.outputs.found == 'true'
+        id: prettier_check
+        run: |
+          npm install -g prettier > /dev/null 2>&1
+          echo "## Prettier Format Check" >> "$GITHUB_STEP_SUMMARY"
+          if prettier --check '**/*.{json,yml,yaml,md}' --no-error-on-unmatched-pattern 2>&1 | tee /tmp/prettier-fmt.txt; then
+            echo "All JSON/YAML/Markdown files are formatted correctly." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cat /tmp/prettier-fmt.txt >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            echo "prettier_failed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fail if any check failed
+        if: always()
+        run: |
+          if [ "${{ steps.cpp_check.outputs.cpp_failed }}" = "true" ] || \
+             [ "${{ steps.py_check.outputs.py_failed }}" = "true" ] || \
+             [ "${{ steps.prettier_check.outputs.prettier_failed }}" = "true" ]; then
+            echo "::error::Formatting violations found. Run the formatters locally and push the fixes."
+            exit 1
+          fi
