@@ -22,7 +22,7 @@ on:
       claude_model:
         description: "Claude model to use for review"
         type: string
-        default: "claude-sonnet-4-6"
+        default: "claude-opus-4-7"
       max_diff_chars:
         description: "Maximum characters of diff to send to Claude"
         type: number
