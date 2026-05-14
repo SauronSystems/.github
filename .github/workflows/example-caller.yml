@@ -15,6 +15,6 @@ jobs:
     secrets: inherit
     ## Override defaults by uncommenting:
     # with:
-    #   claude_model: "claude-sonnet-4-6"
+    #   claude_model: "claude-opus-4-7"
     #   max_diff_chars: 80000
     #   review_focus: "Pay special attention to SQL injection and auth checks"
